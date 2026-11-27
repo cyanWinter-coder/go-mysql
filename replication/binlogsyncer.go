@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -204,6 +205,58 @@ type BinlogSyncerConfig struct {
 	// This should not be used together with StartBackupWithHandler.
 	// If this is not nil, GetEvent does not need to be called.
 	SynchronousEventHandler EventHandler `json:"-"`
+
+	// ManualCheckpoint makes the syncer resume only from checkpoints the
+	// downstream has explicitly confirmed through AcknowledgePosition or
+	// AcknowledgeGTID. Leave it false (the default) to keep the legacy
+	// behaviour where every parsed event automatically advances the internal
+	// resume position.
+	//
+	// With ManualCheckpoint enabled, events that were already read but not
+	// confirmed before a disconnect are replayed after reconnecting and
+	// flagged with Replay=true on the BinlogEvent. The downstream must apply
+	// events idempotently (the event's StreamPosition / GTID is the dedup
+	// key) and confirm each applied transaction, ideally in the same
+	// database transaction that writes its data, so the position never moves
+	// ahead of the applied state.
+	ManualCheckpoint bool
+
+	// MaxReconnectBackoff, when positive, bounds how long the syncer keeps
+	// retrying after the stream breaks. If no reconnect has succeeded for
+	// longer than this duration, the stream closes with
+	// *ResumePositionUnavailableError instead of retrying forever. Zero keeps
+	// the legacy unbounded retry behaviour. Note that a purged binlog (server
+	// error 1236 / missing file) always terminates immediately regardless of
+	// this setting.
+	MaxReconnectBackoff time.Duration
+
+	// ReconnectInterval is the wait between failed reconnect attempts. It
+	// defaults to one second when zero or negative. It is mainly a seam for
+	// fast tests; production deployments normally keep the default.
+	ReconnectInterval time.Duration
+
+	// OnReconnect, when set, is called after every successful dump-stream
+	// re-establishment with the resumed checkpoint and the current replication
+	// lag. It gives operators a programmatic hook for metrics/alerting; the
+	// same information is also emitted through Logger.
+	OnReconnect func(status ReconnectStatus) `json:"-"`
+}
+
+// ReconnectStatus describes a successfully re-established dump stream. It is
+// passed to BinlogSyncerConfig.OnReconnect and reported in the reconnect log.
+type ReconnectStatus struct {
+	// Checkpoint is the position the new stream resumes from.
+	Checkpoint Checkpoint
+
+	// LagSeconds is the age, in whole seconds, of the last event the syncer
+	// had read before the reconnect relative to the reconnect time. It is a
+	// best-effort figure from the event header timestamps, not a server-side
+	// measurement, and stays zero until the first event arrives.
+	LagSeconds uint64
+
+	// Attempt is the number of failed reconnect attempts that preceded this
+	// successful one.
+	Attempt int
 }
 
 // EventHandler defines the interface for processing binlog events.
@@ -223,12 +276,49 @@ type BinlogSyncer struct {
 
 	parser *BinlogParser
 
+	// nextPos is the read high-water mark: the next binlog offset after the
+	// last event parsed from the stream. It advances as soon as an event is
+	// parsed, before the downstream applies anything, so it must not be used
+	// as a durable resume point. Use confirmedPos / confirmedGset for that.
 	nextPos mysql.Position
 
 	prevGset, currGset mysql.GTIDSet
 
 	// instead of GTIDSet.Clone, use this to speed up calculate prevGset
 	prevMySQLGTIDEvent *GTIDEvent
+
+	// confirmedPos and confirmedGset are the checkpoints acknowledged by the
+	// downstream (or auto-advanced when ManualCheckpoint is false). Reconnect
+	// always resumes from these, never directly from the high-water mark.
+	confirmedPos  mysql.Position
+	confirmedGset mysql.GTIDSet
+
+	// resumeBoundary is the high-water mark captured at the moment a
+	// reconnect happens. Any event at or before it on the new stream is a
+	// replay (Replay=true); events past it are new. The zero value means no
+	// boundary is active (fresh connection or legacy auto-checkpoint mode).
+	resumeBoundaryPos  mysql.Position
+	resumeBoundaryGset mysql.GTIDSet
+	resumeReplay       bool
+
+	// currentEventReplay tracks whether the in-flight transaction is a replay
+	// in GTID mode, so non-GTID events (rows, XID, ...) inherit the flag from
+	// the transaction's GTID event.
+	currentEventReplay bool
+
+	// lastEventTimestamp and lastEventAt drive lag reporting after reconnect.
+	lastEventTimestamp uint32
+	lastEventAt        time.Time
+
+	// disconnectedAt is set when the stream first breaks and cleared on a
+	// successful reconnect; it backs MaxReconnectBackoff.
+	disconnectedAt time.Time
+
+	// retryHook, when non-nil, replaces the network portion of a reconnect
+	// attempt. It is a test seam for injecting deterministic reconnect
+	// failures (e.g. a purged-binlog 1236) without a live server and is never
+	// set in production paths.
+	retryHook func() error
 
 	running bool
 
@@ -509,9 +599,88 @@ func (b *BinlogSyncer) startDumpStream() *BinlogStreamer {
 	return s
 }
 
-// GetNextPosition returns the next position of the syncer
+// GetNextPosition returns the read high-water mark of the syncer. This is the
+// offset after the last event parsed from the network, which may be ahead of
+// the events the downstream has applied. For a position safe to restart from,
+// use ConfirmedCheckpoint.
 func (b *BinlogSyncer) GetNextPosition() mysql.Position {
 	return b.nextPos
+}
+
+// ConfirmedCheckpoint returns the last checkpoint acknowledged by the
+// downstream (or, when ManualCheckpoint is disabled, the high-water mark that
+// is auto-acknowledged as events are parsed). This is the position the syncer
+// will resume from after a reconnect.
+func (b *BinlogSyncer) ConfirmedCheckpoint() Checkpoint {
+	b.m.RLock()
+	defer b.m.RUnlock()
+	return b.confirmedCheckpointLocked()
+}
+
+// confirmedCheckpointLocked returns the confirmed checkpoint without taking
+// the mutex. Callers must already hold b.m (read or write).
+func (b *BinlogSyncer) confirmedCheckpointLocked() Checkpoint {
+	cp := Checkpoint{Position: b.confirmedPos}
+	if b.confirmedGset != nil {
+		cp.GTIDSet = b.confirmedGset.Clone()
+	}
+	return cp
+}
+
+// AcknowledgePosition records pos as durably applied by the downstream. It is
+// the manual counterpart of the automatic checkpoint advancement and only has
+// an effect when ManualCheckpoint is enabled. The acknowledgement is rejected
+// if it would move the confirmed position backwards.
+//
+// Call this inside, or immediately after committing, the same transaction that
+// applied the events up to pos: advancing the checkpoint before the data is
+// durable would silently skip events on the next reconnect.
+func (b *BinlogSyncer) AcknowledgePosition(pos mysql.Position) error {
+	b.m.Lock()
+	defer b.m.Unlock()
+
+	if b.confirmedPos.Name != "" && pos.Compare(b.confirmedPos) < 0 {
+		return errors.Errorf("refusing to acknowledge position %s behind confirmed position %s",
+			pos, b.confirmedPos)
+	}
+	b.confirmedPos = pos
+	return nil
+}
+
+// AcknowledgeGTID records gset as the durably applied GTID set. Like
+// AcknowledgePosition it only takes effect with ManualCheckpoint enabled and
+// rejects sets that do not contain the currently confirmed set.
+func (b *BinlogSyncer) AcknowledgeGTID(gset mysql.GTIDSet) error {
+	if gset == nil {
+		return errors.New("cannot acknowledge a nil GTID set")
+	}
+	b.m.Lock()
+	defer b.m.Unlock()
+
+	if b.confirmedGset != nil && !gset.Contain(b.confirmedGset) {
+		return errors.Errorf("refusing to acknowledge GTID set %s that does not contain confirmed set %s",
+			gset, b.confirmedGset)
+	}
+	b.confirmedGset = gset.Clone()
+	return nil
+}
+
+// LagSeconds reports the age in seconds of the last event the syncer parsed,
+// measured against the local clock. It is zero before the first event and does
+// not advance while only heartbeats arrive, matching the binlog-timestamp
+// based delay semantics used by canal.
+func (b *BinlogSyncer) LagSeconds() uint64 {
+	b.m.RLock()
+	defer b.m.RUnlock()
+
+	if b.lastEventAt.IsZero() || b.lastEventTimestamp == 0 {
+		return 0
+	}
+	lag := uint64(0)
+	if now := uint32(utils.Now().Unix()); now > b.lastEventTimestamp {
+		lag = uint64(now - b.lastEventTimestamp)
+	}
+	return lag
 }
 
 func (b *BinlogSyncer) checkFlavor() {
@@ -536,8 +705,15 @@ func (b *BinlogSyncer) StartSync(pos mysql.Position) (*BinlogStreamer, error) {
 		return nil, errors.Trace(errSyncRunning)
 	}
 
+	// The start position is the first confirmed checkpoint: without an
+	// explicit acknowledgement nothing older than it may be replayed.
+	b.confirmedPos = pos
+	b.confirmedGset = nil
+	b.resumeReplay = false
+	b.disconnectedAt = time.Time{}
+
 	if err := b.prepareSyncPos(pos); err != nil {
-		return nil, errors.Trace(err)
+		return nil, b.wrapResumeError(err, Checkpoint{Position: pos})
 	}
 
 	b.checkFlavor()
@@ -564,6 +740,12 @@ func (b *BinlogSyncer) StartSyncGTID(gset mysql.GTIDSet) (*BinlogStreamer, error
 	// MariadbGTIDEvent/GTIDEvent event is received - we effectively do not have a "current GTID"
 	b.currGset = nil
 
+	// The start GTID set is the first confirmed checkpoint.
+	b.confirmedGset = gset.Clone()
+	b.confirmedPos = mysql.Position{}
+	b.resumeReplay = false
+	b.disconnectedAt = time.Time{}
+
 	if err := b.prepare(); err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -578,7 +760,7 @@ func (b *BinlogSyncer) StartSyncGTID(gset mysql.GTIDSet) (*BinlogStreamer, error
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, b.wrapResumeError(err, Checkpoint{GTIDSet: gset.Clone()})
 	}
 
 	b.checkFlavor()
@@ -753,31 +935,174 @@ func (b *BinlogSyncer) replySemiSyncACK(p mysql.Position) error {
 	return nil
 }
 
+// resumeCheckpoint returns the position the next dump stream must start from:
+// always the confirmed checkpoint, falling back to the read high-water mark
+// when checkpoints are auto-acknowledged (ManualCheckpoint disabled).
+func (b *BinlogSyncer) resumeCheckpoint() Checkpoint {
+	cp := Checkpoint{}
+	if b.prevGset != nil {
+		if b.cfg.ManualCheckpoint && b.confirmedGset != nil {
+			cp.GTIDSet = b.confirmedGset.Clone()
+		} else {
+			cp.GTIDSet = b.prevGset.Clone()
+		}
+	} else {
+		if b.cfg.ManualCheckpoint && b.confirmedPos.Name != "" {
+			cp.Position = b.confirmedPos
+		} else {
+			cp.Position = b.nextPos
+		}
+	}
+	return cp
+}
+
+// markReplayBoundary snapshots the high-water mark before reconnecting so
+// events repeated by the new stream can be identified, then rewinds the
+// position-mode high-water mark to the confirmed resume position. The new
+// dump starts there, so the first replayed event's origin equals the
+// confirmed checkpoint rather than the stale pre-disconnect high-water mark.
+// In manual checkpoint mode the boundary is the old high-water mark and
+// anything up to it is a replay; in legacy mode the resume point already
+// equals the high-water mark, so no event is flagged.
+func (b *BinlogSyncer) markReplayBoundary(cp Checkpoint) {
+	b.resumeBoundaryPos = b.nextPos
+	b.resumeBoundaryGset = nil
+	if b.currGset != nil {
+		b.resumeBoundaryGset = b.currGset.Clone()
+	} else if b.prevGset != nil {
+		b.resumeBoundaryGset = b.prevGset.Clone()
+	}
+	// Only manual mode leaves an acknowledged-but-not-caught-up window that
+	// can produce replay events. Legacy auto-checkpoint mode resumes exactly
+	// at the high-water mark.
+	b.resumeReplay = b.cfg.ManualCheckpoint
+	b.currentEventReplay = false
+
+	// Rewind the position-mode state to where the new dump actually starts.
+	// GTID mode has no file/offset to rewind and drives replay classification
+	// entirely through GTID containment.
+	if cp.GTIDSet == nil {
+		b.nextPos = cp.Position
+	}
+}
+
 func (b *BinlogSyncer) retrySync() error {
 	b.m.Lock()
-	defer b.m.Unlock()
-
 	b.parser.Reset()
 	b.prevMySQLGTIDEvent = nil
 
-	if b.prevGset != nil {
-		extra := []any{slog.String("GTID Set", b.prevGset.String())}
-		if b.currGset != nil {
-			extra = append(extra, slog.String("last read GTID", b.currGset.String()))
-		}
-		b.cfg.Logger.Info("begin to re-sync", extra...)
+	cp := b.resumeCheckpoint()
+	b.markReplayBoundary(cp)
+	b.m.Unlock()
 
-		if err := b.prepareSyncGTID(b.prevGset); err != nil {
-			return errors.Trace(err)
+	// Test seam: inject a deterministic reconnect failure without touching
+	// the network. Production configs leave retryHook nil.
+	if b.retryHook != nil {
+		if err := b.retryHook(); err != nil {
+			return b.wrapResumeError(err, cp)
+		}
+	} else if cp.GTIDSet != nil {
+		b.cfg.Logger.Info("begin to re-sync from confirmed checkpoint",
+			slog.String("resume GTID set", cp.GTIDSet.String()),
+			slog.String("checkpoint", cp.String()))
+		if err := b.prepareSyncGTID(cp.GTIDSet); err != nil {
+			return b.wrapResumeError(err, cp)
 		}
 	} else {
-		b.cfg.Logger.Info("begin to re-sync", slog.String("file", b.nextPos.Name), slog.Uint64("position", uint64(b.nextPos.Pos)))
-		if err := b.prepareSyncPos(b.nextPos); err != nil {
-			return errors.Trace(err)
+		b.cfg.Logger.Info("begin to re-sync from confirmed checkpoint",
+			slog.String("file", cp.Position.Name),
+			slog.Uint64("position", uint64(cp.Position.Pos)),
+			slog.String("checkpoint", cp.String()))
+		if err := b.prepareSyncPos(cp.Position); err != nil {
+			return b.wrapResumeError(err, cp)
 		}
 	}
 
+	// A successful reconnect: clear the outage timer and report the resumed
+	// position plus lag so operators can confirm the stream picked up where
+	// the confirmed checkpoint says it should.
+	b.m.Lock()
+	status := ReconnectStatus{
+		Checkpoint: cp,
+		LagSeconds: b.lagSecondsLocked(),
+		Attempt:    b.retryCount,
+	}
+	b.disconnectedAt = time.Time{}
+	b.retryCount = 0
+	b.m.Unlock()
+
+	b.cfg.Logger.Info("re-sync established",
+		slog.String("checkpoint", cp.String()),
+		slog.Uint64("lagSeconds", status.LagSeconds),
+		slog.Int("attempt", status.Attempt))
+	if b.cfg.OnReconnect != nil {
+		b.cfg.OnReconnect(status)
+	}
+
 	return nil
+}
+
+// wrapResumeError converts a server-side "position no longer available"
+// failure (error 1236, e.g. a purged binlog file) into a typed
+// ResumePositionUnavailableError carrying the checkpoint that was attempted.
+// Other errors are returned unchanged so the retry loop can keep handling
+// transient network failures.
+func (b *BinlogSyncer) wrapResumeError(err error, cp Checkpoint) error {
+	if err == nil {
+		return nil
+	}
+	if isResumePositionUnavailable(err) {
+		if _, ok := err.(*ResumePositionUnavailableError); !ok {
+			err = &ResumePositionUnavailableError{Resume: cp, Reason: err}
+		}
+		b.cfg.Logger.Error("resume position unavailable, stopping retries",
+			slog.String("checkpoint", cp.String()), slog.Any("error", err))
+	}
+	return errors.Trace(err)
+}
+
+// verifyResumePositionAvailable checks that the server still retains the
+// binlog file a position-mode resume wants to start from. It is a client-side
+// guard in addition to the server's 1236 error: SHOW BINARY LOGS lists every
+// available file, so a missing file means the required events were purged and
+// reconnecting cannot make progress. GTID resumes rely on the server response
+// because there is no file-level boundary to compare against.
+func (b *BinlogSyncer) verifyResumePositionAvailable(pos mysql.Position) error {
+	if pos.Name == "" {
+		return nil
+	}
+	r, err := b.c.Execute("SHOW BINARY LOGS")
+	if err != nil {
+		// Some servers/MariaDB versions name this differently or restrict it;
+		// a failed probe must not block reconnects that the server would
+		// otherwise accept. The 1236 path still catches real purges.
+		b.cfg.Logger.Warn("could not verify binlog file availability, skipping check",
+			slog.Any("error", err))
+		return nil
+	}
+	for i := 0; i < r.RowNumber(); i++ {
+		name, _ := r.GetString(i, 0)
+		if name == pos.Name {
+			return nil
+		}
+	}
+	return &ResumePositionUnavailableError{
+		Resume: Checkpoint{Position: pos},
+		Reason: errors.Errorf("binlog file %s is not present in SHOW BINARY LOGS, it has been purged", pos.Name),
+	}
+}
+
+// lagSecondsLocked computes lag without taking the mutex; callers must hold
+// b.m (retrySync does while re-establishing the stream).
+func (b *BinlogSyncer) lagSecondsLocked() uint64 {
+	if b.lastEventAt.IsZero() || b.lastEventTimestamp == 0 {
+		return 0
+	}
+	now := uint32(utils.Now().Unix())
+	if now <= b.lastEventTimestamp {
+		return 0
+	}
+	return uint64(now - b.lastEventTimestamp)
 }
 
 func (b *BinlogSyncer) prepareSyncPos(pos mysql.Position) error {
@@ -787,6 +1112,12 @@ func (b *BinlogSyncer) prepareSyncPos(pos mysql.Position) error {
 	}
 
 	if err := b.prepare(); err != nil {
+		return errors.Trace(err)
+	}
+
+	// Fail explicitly instead of silently starting from the newest binlog
+	// when the file we need has been purged server-side.
+	if err := b.verifyResumePositionAvailable(pos); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -868,7 +1199,7 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 				return
 			}
 			// we meet connection error, should re-connect again with
-			// last nextPos or nextGTID we got.
+			// the last confirmed checkpoint we got.
 			if len(b.nextPos.Name) == 0 && b.prevGset == nil {
 				// we can't get the correct position, close.
 				s.closeWithError(err)
@@ -881,14 +1212,56 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 				return
 			}
 
+			b.m.Lock()
+			if b.disconnectedAt.IsZero() {
+				b.disconnectedAt = utils.Now()
+			}
+			b.m.Unlock()
+
+			wait := b.cfg.ReconnectInterval
+			if wait <= 0 {
+				wait = time.Second
+			}
 			for {
 				select {
 				case <-b.ctx.Done():
 					s.close()
 					return
-				case <-time.After(time.Second):
+				case <-time.After(wait):
 					b.retryCount++
 					if err = b.retrySync(); err != nil {
+						// A purged binlog / unknown GTID position is not
+						// transient: retrying the same position forever would
+						// never succeed and must not degrade into a silent
+						// restart at the newest position. Stop on a clear,
+						// typed error and wait for a manual restart.
+						if unavailable := (*ResumePositionUnavailableError)(nil); stderrors.As(err, &unavailable) {
+							b.cfg.Logger.Error("resume position unavailable, sync stopped, awaiting manual intervention",
+								slog.Any("error", err))
+							s.closeWithError(err)
+							return
+						}
+
+						if b.cfg.MaxReconnectBackoff > 0 {
+							b.m.RLock()
+							outage := time.Duration(0)
+							if !b.disconnectedAt.IsZero() {
+								outage = time.Since(b.disconnectedAt)
+							}
+							b.m.RUnlock()
+							if outage >= b.cfg.MaxReconnectBackoff {
+								stopErr := &ResumePositionUnavailableError{
+									Resume: b.ConfirmedCheckpoint(),
+									Reason: errors.Errorf("reconnect backoff %s exhausted while the server is unreachable: %v",
+										b.cfg.MaxReconnectBackoff, err),
+								}
+								b.cfg.Logger.Error("max reconnect backoff exhausted, sync stopped",
+									slog.Any("error", stopErr))
+								s.closeWithError(stopErr)
+								return
+							}
+						}
+
 						if b.cfg.MaxReconnectAttempts > 0 && b.retryCount >= b.cfg.MaxReconnectAttempts {
 							b.cfg.Logger.Error(
 								"retry sync err, exceeded max retries",
@@ -899,7 +1272,7 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 						}
 
 						b.cfg.Logger.Error(
-							"retry sync err, wait 1s and retry again",
+							"retry sync err, waiting to retry again",
 							slog.Any("error", err), slog.Int("retryCount", b.retryCount), slog.Int("maxAttempts", b.cfg.MaxReconnectAttempts),
 						)
 						continue
@@ -933,6 +1306,12 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 			}
 		case mysql.ERR_HEADER:
 			err = b.c.HandleErrorPacket(data)
+			// A purge/rotation race surfaces mid-stream as 1236. Wrap it as a
+			// non-retryable resume failure rather than looping on a position
+			// the server can never serve again.
+			if isResumePositionUnavailable(err) {
+				err = b.wrapResumeError(err, b.ConfirmedCheckpoint())
+			}
 			s.closeWithError(err)
 			return
 		case mysql.EOF_HEADER:
@@ -973,8 +1352,24 @@ func (b *BinlogSyncer) parseEvent(data []byte) (event *BinlogEvent, needACK bool
 }
 
 // handleEventAndACK processes an event and sends an ACK if necessary.
+//
+// Position semantics: parsing (including CRC verification, when enabled) has
+// already succeeded by the time this runs, so the event is known to be intact.
+// The read high-water mark (nextPos) advances here, but the confirmed
+// checkpoint only moves when ManualCheckpoint is disabled (auto-acknowledge)
+// or when the downstream calls AcknowledgePosition/AcknowledgeGTID. A
+// reconnect therefore resumes from the confirmed checkpoint and replays
+// unconfirmed events with Replay=true rather than skipping them.
 func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, needACK bool) error {
-	// Update the next position based on the event's LogPos
+	// Capture the event's origin position before any header/rotate update
+	// overwrites nextPos. This is the offset the event starts at and a stable
+	// dedup key for the downstream across replays.
+	originPos := b.nextPos
+
+	// Update the next position based on the event's LogPos. This only runs
+	// after parseEvent has validated the event (and its checksum when
+	// VerifyChecksum is on), so the high-water mark never jumps over a failed
+	// verification step.
 	if e.Header.LogPos > 0 {
 		// Some events like FormatDescriptionEvent return 0, ignore.
 		b.nextPos.Pos = e.Header.LogPos
@@ -986,6 +1381,21 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 			slog.String("eventType", e.Header.EventType.String()),
 			slog.Uint64("logPos", uint64(calculatedPos)))
 	}
+
+	e.StreamPosition = originPos
+	// Position-mode replay can be decided now. GTID-mode events inherit the
+	// flag of their transaction's GTID event, which is set inside the switch
+	// below, so for GTID mode the flag is finalised after the switch.
+	if b.prevGset == nil {
+		e.Replay = b.isReplayEvent(e)
+	}
+
+	b.m.Lock()
+	if e.Header.Timestamp > 0 {
+		b.lastEventTimestamp = e.Header.Timestamp
+		b.lastEventAt = utils.Now()
+	}
+	b.m.Unlock()
 
 	// Handle event types to update positions and GTID sets
 	switch event := e.Event.(type) {
@@ -1011,6 +1421,12 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 			return errors.Trace(err)
 		}
 		b.currGset.(*mysql.MysqlGTIDSet).AddGTID(u, event.GNO)
+		// The GTID just observed decides whether this whole transaction is a
+		// replay; subsequent row/XID events inherit currentEventReplay.
+		if gset, gerr := event.GTIDNext(); gerr == nil {
+			b.currentEventReplay = b.isGTIDReplay(gset)
+		}
+		e.Replay = b.currentEventReplay
 		if b.prevMySQLGTIDEvent != nil {
 			u, err = uuid.FromBytes(b.prevMySQLGTIDEvent.SID)
 			if err != nil {
@@ -1032,6 +1448,10 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 			return errors.Trace(err)
 		}
 		b.currGset.(*mysql.MysqlGTIDSet).AddGTIDWithTag(u, event.Tag, event.GNO)
+		if gset, gerr := event.GTIDNext(); gerr == nil {
+			b.currentEventReplay = b.isGTIDReplay(gset)
+		}
+		e.Replay = b.currentEventReplay
 		if b.prevMySQLGTIDEvent != nil {
 			u, err = uuid.FromBytes(b.prevMySQLGTIDEvent.SID)
 			if err != nil {
@@ -1052,6 +1472,10 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 		if err != nil {
 			return errors.Trace(err)
 		}
+		if gset, gerr := event.GTIDNext(); gerr == nil {
+			b.currentEventReplay = b.isGTIDReplay(gset)
+		}
+		e.Replay = b.currentEventReplay
 		// Right after reconnect we may see the same GTID as before; update prevGset if currGset changed
 		if !b.currGset.Equal(prev) {
 			b.prevGset = prev
@@ -1083,6 +1507,19 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 		}
 	}
 
+	// GTID mode: every non-GTID event belongs to the transaction opened by
+	// the most recent GTID event and reuses that transaction's replay flag.
+	// GTID events already set their own flag inside the switch; position
+	// mode decided the flag before the switch.
+	if b.prevGset != nil {
+		switch e.Event.(type) {
+		case *GTIDEvent, *GtidTaggedLogEvent, *MariadbGTIDEvent:
+			// already set above
+		default:
+			e.Replay = b.currentEventReplay
+		}
+	}
+
 	// Use SynchronousEventHandler if it's set
 	if b.cfg.SynchronousEventHandler != nil {
 		err := b.cfg.SynchronousEventHandler.HandleEvent(e)
@@ -1098,6 +1535,15 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 		}
 	}
 
+	// Auto-acknowledge mode: the confirmed checkpoint follows the high-water
+	// mark, preserving the legacy resume behaviour. In manual mode it is left
+	// untouched here and only moves via AcknowledgePosition/AcknowledgeGTID,
+	// which the downstream calls after applying the event in its own
+	// transaction.
+	if !b.cfg.ManualCheckpoint {
+		b.advanceConfirmedCheckpoint(e)
+	}
+
 	if needACK {
 		err := b.replySemiSyncACK(b.nextPos)
 		if err != nil {
@@ -1106,6 +1552,45 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 	}
 
 	return nil
+}
+
+// advanceConfirmedCheckpoint moves the confirmed checkpoint to the current
+// high-water mark after an event has been verified and delivered. It is only
+// used for automatic (non-manual) checkpointing; manual mode relies on the
+// explicit Acknowledge* calls so position advancement stays inside the
+// downstream's application transaction.
+func (b *BinlogSyncer) advanceConfirmedCheckpoint(e *BinlogEvent) {
+	b.confirmedPos = b.nextPos
+	switch e.Event.(type) {
+	case *GTIDEvent, *GtidTaggedLogEvent, *MariadbGTIDEvent, *XIDEvent, *QueryEvent:
+		if b.currGset != nil {
+			b.confirmedGset = b.currGset.Clone()
+		}
+	}
+}
+
+// isReplayEvent decides whether an event on a freshly reconnected
+// position-mode stream was already delivered before the disconnect. The
+// boundary is the offset immediately after the last event read before the
+// disconnect, so an event is a replay only while its origin is strictly
+// before it; an event starting at the boundary is new. GTID-mode streams
+// classify events per transaction through isGTIDReplay instead, so this is
+// only called when prevGset is nil.
+func (b *BinlogSyncer) isReplayEvent(e *BinlogEvent) bool {
+	if !b.resumeReplay || b.resumeBoundaryPos.Name == "" {
+		return false
+	}
+	return e.StreamPosition.Compare(b.resumeBoundaryPos) < 0
+}
+
+// isGTIDReplay reports whether a transaction identified by gtid was already
+// observed before the reconnect, i.e. its GTID is contained in the boundary
+// GTID set.
+func (b *BinlogSyncer) isGTIDReplay(gtid mysql.GTIDSet) bool {
+	if !b.resumeReplay || b.resumeBoundaryGset == nil {
+		return false
+	}
+	return b.resumeBoundaryGset.Contain(gtid)
 }
 
 // shouldCalculateDynamicLogPos determines if we should calculate LogPos dynamically for MariaDB events.

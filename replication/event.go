@@ -33,6 +33,23 @@ type BinlogEvent struct {
 
 	Header *EventHeader
 	Event  Event
+
+	// StreamPosition is the binlog position this event starts at, i.e. the
+	// resume position from which the *next* event would be read if the stream
+	// broke before this event was confirmed. Together with the binlog file
+	// name it is a stable identity for the event, so downstream consumers can
+	// deduplicate replays by (file, StreamPosition) in position mode. It is
+	// captured before the event is delivered and is not mutated by later
+	// events or reconnects.
+	StreamPosition mysql.Position
+
+	// Replay is true when this event was already delivered on a previous
+	// connection and is being sent again after a reconnect. The syncer
+	// resumes from the last confirmed checkpoint, so any event whose origin
+	// position/GTID the syncer had already observed before the disconnect is
+	// flagged here and must be applied idempotently (or skipped) downstream.
+	// Events received for the first time always have Replay == false.
+	Replay bool
 }
 
 func (e *BinlogEvent) Dump(w io.Writer) {
