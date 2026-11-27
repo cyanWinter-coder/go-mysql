@@ -57,6 +57,10 @@ type (
 		// Only for stats
 		IdleCount    int
 		CreatedCount int64
+		// FailedCount counts connections that never became usable (dial or
+		// handshake failure). They are closed immediately and never returned
+		// to the pool, so FailedCount grows without TotalCount growing.
+		FailedCount int64
 	}
 
 	Connection struct {
@@ -221,6 +225,20 @@ func (pool *Pool) GetConn(ctx context.Context) (*Conn, error) {
 
 // PutConn returns working connection back to pool
 func (pool *Pool) PutConn(conn *Conn) {
+	if conn == nil {
+		return
+	}
+	if !conn.HandshakeCompleted() {
+		// A connection whose handshake failed must never re-enter the pool:
+		// close it and account for it instead of pooling it.
+		pool.synchro.Lock()
+		pool.synchro.stats.FailedCount++
+		pool.synchro.Unlock()
+		if conn.Conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
 	pool.putConnection(Connection{
 		conn:      conn,
 		lastUseAt: pool.nowTs(),
@@ -348,6 +366,9 @@ func (pool *Pool) createNewConnection() (Connection, error) {
 
 	connection.conn, err = pool.connect()
 	if err != nil {
+		pool.synchro.Lock()
+		pool.synchro.stats.FailedCount++
+		pool.synchro.Unlock()
 		return Connection{}, errors.Errorf(`Could not connect to mysql: %s`, err)
 	}
 	connection.lastUseAt = pool.nowTs()

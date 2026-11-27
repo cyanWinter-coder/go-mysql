@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
@@ -85,10 +86,12 @@ func (c *Conn) readInitialHandshake() error {
 	c.capability = uint32(binary.LittleEndian.Uint16(data[pos : pos+2]))
 	// check protocol
 	if c.capability&mysql.CLIENT_PROTOCOL_41 == 0 {
-		return errors.New("the MySQL server can not support protocol 41 and above required by the client")
+		return fmt.Errorf("%w: the MySQL server can not support protocol 41 and above required by the client",
+			mysql.ErrHandshakeCapabilityMismatch)
 	}
 	if c.capability&mysql.CLIENT_SSL == 0 && c.tlsConfig != nil {
-		return errors.New("the MySQL Server does not support TLS required by the client")
+		return fmt.Errorf("%w: the MySQL Server does not support TLS required by the client",
+			mysql.ErrHandshakeCapabilityMismatch)
 	}
 	pos += 2
 
@@ -209,7 +212,7 @@ func (c *Conn) genAttributes() []byte {
 // See: http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse
 func (c *Conn) writeAuthHandshake() error {
 	if !authPluginAllowed(c.authPluginName) {
-		return fmt.Errorf("unknown auth plugin name '%s'", c.authPluginName)
+		return fmt.Errorf("%w: unknown auth plugin name '%s'", mysql.ErrHandshakeCapabilityMismatch, c.authPluginName)
 	}
 
 	// Set default client capabilities that reflect the abilities of this library
@@ -312,10 +315,13 @@ func (c *Conn) writeAuthHandshake() error {
 		}
 
 		// Switch to TLS
+		tlsStart := time.Now()
 		tlsConn := tls.Client(c.Conn.Conn, c.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
-			return err
+			c.handshakeTimings.Record(mysql.HandshakePhaseTLS, time.Since(tlsStart))
+			return fmt.Errorf("%w: %w", mysql.ErrHandshakeTLS, err)
 		}
+		c.handshakeTimings.Record(mysql.HandshakePhaseTLS, time.Since(tlsStart))
 
 		currentSequence := c.Sequence
 		c.Conn = packet.NewConnWithTimeout(tlsConn, c.ReadTimeout, c.WriteTimeout, c.BufferSize)

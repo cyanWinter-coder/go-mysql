@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,6 +66,14 @@ type Conn struct {
 	authPluginName string
 
 	connectionID uint32
+
+	// handshakeDone is set once the connection-phase negotiation completed
+	// successfully. A Conn whose handshake failed is closed and must not be
+	// reused or returned to a connection pool.
+	handshakeDone bool
+	// handshakeTimings collects the per-phase durations of the handshake,
+	// for diagnostics on both success and failure.
+	handshakeTimings *mysql.HandshakeTimings
 
 	queryAttributes []mysql.QueryAttribute
 
@@ -164,6 +173,8 @@ func ConnectWithDialer(ctx context.Context, network, addr, user, password, dbNam
 		c.Sequence = seq
 	}
 
+	c.handshakeTimings = mysql.NewHandshakeTimings()
+
 	if err = c.handshake(); err != nil {
 		// in the event of an error c.handshake() will close the connection
 		return nil, errors.Trace(err)
@@ -195,25 +206,101 @@ func ConnectWithDialer(ctx context.Context, network, addr, user, password, dbNam
 	return c, nil
 }
 
+// handshake runs the connection-phase negotiation in protocol order:
+// server greeting, capability negotiation (with the optional TLS upgrade),
+// then authentication. A failure in any phase aborts the handshake: later
+// phases are not attempted, the transport is closed, and the returned
+// *mysql.HandshakeError carries the failed phase, the peer address, and the
+// per-phase timings collected up to the failure.
 func (c *Conn) handshake() error {
 	var err error
+
+	start := time.Now()
 	if err = c.readInitialHandshake(); err != nil {
-		c.Close()
-		return errors.Trace(fmt.Errorf("readInitialHandshake: %w", err))
+		c.handshakeTimings.Record(mysql.HandshakePhaseGreeting, time.Since(start))
+		return c.failHandshake(mysql.HandshakePhaseGreeting, err)
+	}
+	c.handshakeTimings.Record(mysql.HandshakePhaseGreeting, time.Since(start))
+
+	if err = c.writeAuthHandshake(); err != nil {
+		return c.failHandshake(mysql.HandshakePhaseCapability, err)
 	}
 
-	if err := c.writeAuthHandshake(); err != nil {
-		c.Close()
-
-		return errors.Trace(fmt.Errorf("writeAuthHandshake: %w", err))
+	start = time.Now()
+	if err = c.handleAuthResult(); err != nil {
+		c.handshakeTimings.Record(mysql.HandshakePhaseAuth, time.Since(start))
+		return c.failHandshake(mysql.HandshakePhaseAuth, err)
 	}
+	c.handshakeTimings.Record(mysql.HandshakePhaseAuth, time.Since(start))
 
-	if err := c.handleAuthResult(); err != nil {
-		c.Close()
-		return errors.Trace(fmt.Errorf("handleAuthResult: %w", err))
-	}
-
+	c.handshakeDone = true
 	return nil
+}
+
+// failHandshake closes the connection and reports err as a
+// *mysql.HandshakeError. The phase is refined from the error itself when it
+// carries a stable classification, so e.g. a capability mismatch detected
+// while reading the greeting is reported in the capability phase.
+func (c *Conn) failHandshake(phase mysql.HandshakePhase, err error) error {
+	kind := handshakeFailureKind(err)
+	switch kind {
+	case mysql.ErrHandshakeCapabilityMismatch:
+		phase = mysql.HandshakePhaseCapability
+	case mysql.ErrHandshakeTLS:
+		phase = mysql.HandshakePhaseTLS
+	case mysql.ErrHandshakeAuth:
+		phase = mysql.HandshakePhaseAuth
+	}
+
+	// Capture the peer address before closing: a failed handshake must not
+	// leave a half-open connection behind, and the read buffer may hold
+	// bytes from the failed negotiation that a retry must never see.
+	remote := ""
+	if c.Conn != nil && c.Conn.Conn != nil {
+		if addr := c.Conn.Conn.RemoteAddr(); addr != nil {
+			remote = addr.String()
+		}
+	}
+	c.Close()
+
+	return &mysql.HandshakeError{
+		Phase:      phase,
+		Kind:       kind,
+		RemoteAddr: remote,
+		Timings:    c.handshakeTimings,
+		Err:        err,
+	}
+}
+
+// handshakeFailureKind maps err to one of the stable mysql.ErrHandshake*
+// identifiers, or returns nil if the failure has no stable classification.
+func handshakeFailureKind(err error) error {
+	switch {
+	case stderrors.Is(err, mysql.ErrHandshakeCapabilityMismatch):
+		return mysql.ErrHandshakeCapabilityMismatch
+	case stderrors.Is(err, mysql.ErrHandshakeTLS):
+		return mysql.ErrHandshakeTLS
+	case stderrors.Is(err, mysql.ErrHandshakeAuth):
+		return mysql.ErrHandshakeAuth
+	}
+	// A MyError in the auth phase is the server rejecting the credentials.
+	var myErr *mysql.MyError
+	if stderrors.As(err, &myErr) && myErr.Code == mysql.ER_ACCESS_DENIED_ERROR {
+		return mysql.ErrHandshakeAuth
+	}
+	return nil
+}
+
+// HandshakeCompleted reports whether the connection-phase negotiation
+// finished successfully. Connection pools use it to keep connections whose
+// handshake failed out of the pool.
+func (c *Conn) HandshakeCompleted() bool {
+	return c.handshakeDone
+}
+
+// HandshakeTimings returns the per-phase durations of the handshake.
+func (c *Conn) HandshakeTimings() *mysql.HandshakeTimings {
+	return c.handshakeTimings
 }
 
 // Close directly closes the connection. Use Quit() to first send COM_QUIT to the server and then close the connection.

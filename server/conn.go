@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
@@ -105,30 +106,98 @@ func (s *Server) NewCustomizedConn(conn net.Conn, authHandler AuthenticationHand
 	return c, nil
 }
 
+// handshake runs the connection-phase negotiation in protocol order:
+// server greeting, then the client's handshake response (capability
+// negotiation, optional TLS upgrade, authentication). A failure in any
+// phase aborts the handshake: later phases are not attempted, the caller
+// closes the connection, and the returned *mysql.HandshakeError carries
+// the failed phase, the peer address, and the per-phase timings collected
+// up to the failure.
 func (c *Conn) handshake() error {
-	if err := c.writeInitialHandshake(); err != nil {
-		return err
-	}
+	timings := mysql.NewHandshakeTimings()
 
+	start := time.Now()
+	if err := c.writeInitialHandshake(); err != nil {
+		timings.Record(mysql.HandshakePhaseGreeting, time.Since(start))
+		return c.failHandshake(mysql.HandshakePhaseGreeting, nil, timings, err)
+	}
+	timings.Record(mysql.HandshakePhaseGreeting, time.Since(start))
+
+	start = time.Now()
 	if err := c.readHandshakeResponse(); err != nil {
+		timings.Record(mysql.HandshakePhaseAuth, time.Since(start))
+		kind := handshakeFailureKind(err)
 		err = c.accessDeniedError(err)
 		c.authHandler.OnAuthFailure(c, err)
-		_ = c.writeError(err)
-		return err
+		// Report the failure to the client only when the transport is still
+		// intact: after a failed TLS upgrade the peer expects a TLS stream,
+		// so plaintext error bytes must not be written, and the remaining
+		// bytes must not be parsed as plaintext either.
+		if !errors.Is(err, mysql.ErrHandshakeTLS) {
+			_ = c.writeError(err)
+		}
+		return c.failHandshake(handshakeFailurePhase(kind), kind, timings, err)
 	}
+	timings.Record(mysql.HandshakePhaseAuth, time.Since(start))
 
 	if err := c.authHandler.OnAuthSuccess(c); err != nil {
 		_ = c.writeError(err)
-		return err
+		return c.failHandshake(mysql.HandshakePhaseAuth, nil, timings, err)
 	}
 
 	if err := c.writeOK(nil); err != nil {
-		return err
+		return c.failHandshake(mysql.HandshakePhaseAuth, nil, timings, err)
 	}
 
 	c.ResetSequence()
 
 	return nil
+}
+
+// handshakeFailureKind maps err to one of the stable mysql.ErrHandshake*
+// identifiers, or returns nil if the failure has no stable classification
+// (e.g. a malformed handshake packet). It must be called before
+// accessDeniedError, which converts ErrAccessDenied into a MyError.
+func handshakeFailureKind(err error) error {
+	switch {
+	case errors.Is(err, mysql.ErrHandshakeTLS):
+		return mysql.ErrHandshakeTLS
+	case errors.Is(err, mysql.ErrHandshakeCapabilityMismatch):
+		return mysql.ErrHandshakeCapabilityMismatch
+	case errors.Is(err, ErrAccessDenied):
+		return mysql.ErrHandshakeAuth
+	}
+	return nil
+}
+
+// handshakeFailurePhase derives the failed negotiation phase from the
+// failure classification; unclassified failures of the handshake response
+// are reported in the auth phase, where they are detected.
+func handshakeFailurePhase(kind error) mysql.HandshakePhase {
+	switch kind {
+	case mysql.ErrHandshakeTLS:
+		return mysql.HandshakePhaseTLS
+	case mysql.ErrHandshakeCapabilityMismatch:
+		return mysql.HandshakePhaseCapability
+	default:
+		return mysql.HandshakePhaseAuth
+	}
+}
+
+// failHandshake reports err as a *mysql.HandshakeError carrying the peer
+// address and the per-phase timings collected up to the failure.
+func (c *Conn) failHandshake(phase mysql.HandshakePhase, kind error, timings *mysql.HandshakeTimings, err error) error {
+	remote := ""
+	if addr := c.RemoteAddr(); addr != nil {
+		remote = addr.String()
+	}
+	return &mysql.HandshakeError{
+		Phase:      phase,
+		Kind:       kind,
+		RemoteAddr: remote,
+		Timings:    timings,
+		Err:        err,
+	}
 }
 
 // accessDeniedError turns ErrAccessDenied into the ER_ACCESS_DENIED_ERROR a

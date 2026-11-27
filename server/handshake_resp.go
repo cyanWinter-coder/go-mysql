@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	stderrors "errors"
+	"fmt"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/errors"
@@ -81,13 +82,15 @@ func (c *Conn) decodeFirstPart(data []byte) (newData []byte, pos int, err error)
 
 	// check CLIENT_PROTOCOL_41
 	if uint32(binary.LittleEndian.Uint16(data[:2]))&mysql.CLIENT_PROTOCOL_41 == 0 {
-		return nil, 0, errors.New("CLIENT_PROTOCOL_41 compatible client is required")
+		return nil, 0, fmt.Errorf("%w: CLIENT_PROTOCOL_41 compatible client is required",
+			mysql.ErrHandshakeCapabilityMismatch)
 	}
 
 	// capability
 	c.capability = binary.LittleEndian.Uint32(data[:4])
 	if c.capability&mysql.CLIENT_SECURE_CONNECTION == 0 {
-		return nil, 0, errors.New("CLIENT_SECURE_CONNECTION compatible client is required")
+		return nil, 0, fmt.Errorf("%w: CLIENT_SECURE_CONNECTION compatible client is required",
+			mysql.ErrHandshakeCapabilityMismatch)
 	}
 	pos += 4
 
@@ -105,12 +108,15 @@ func (c *Conn) decodeFirstPart(data []byte) (newData []byte, pos int, err error)
 	// is this a SSLRequest packet?
 	if len(data) == (4 + 4 + 1 + 23) {
 		if c.serverConf.capability&mysql.CLIENT_SSL == 0 {
-			return nil, 0, errors.Errorf("The host '%s' does not support SSL connections", c.RemoteAddr().String())
+			return nil, 0, fmt.Errorf("%w: the host '%s' does not support SSL connections",
+				mysql.ErrHandshakeCapabilityMismatch, c.RemoteAddr().String())
 		}
 		// switch to TLS
 		tlsConn := tls.Server(c.Conn.Conn, c.serverConf.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
-			return nil, 0, err
+			// Do not fall through to readFirstPart: the bytes after a failed
+			// TLS handshake are not a plaintext handshake response.
+			return nil, 0, fmt.Errorf("%w: %w", mysql.ErrHandshakeTLS, err)
 		}
 		c.Conn.Conn = tlsConn
 
