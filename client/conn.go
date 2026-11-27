@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"math/bits"
 	"net"
@@ -43,6 +44,22 @@ type Conn struct {
 
 	// The buffer size to use in the packet connection
 	BufferSize int
+
+	// MaxPacketSize caps the size of any packet read from the server, applied
+	// to the whole logical packet (including continuation frames) and to data
+	// already buffered. 0 (the default) means unlimited: set an explicit
+	// threshold to bound memory per connection. An oversized response
+	// disconnects this connection with packet.ErrPacketTooLarge.
+	MaxPacketSize int
+
+	// ReadLimiter optionally shares a process-wide read-memory budget with
+	// other connections; see packet.ReadLimiter. Nil (default) means no
+	// process-wide limit.
+	ReadLimiter *packet.ReadLimiter
+
+	// readLogger records forced disconnects from read-protection rules; set
+	// via WithReadLogger.
+	readLogger *slog.Logger
 
 	serverVersion string
 	// server capabilities
@@ -163,6 +180,7 @@ func ConnectWithDialer(ctx context.Context, network, addr, user, password, dbNam
 		c.Conn = packet.NewTLSConnWithTimeout(conn, c.ReadTimeout, c.WriteTimeout)
 		c.Sequence = seq
 	}
+	c.applyReadProtection()
 
 	if err = c.handshake(); err != nil {
 		// in the event of an error c.handshake() will close the connection

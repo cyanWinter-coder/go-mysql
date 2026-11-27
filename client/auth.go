@@ -320,6 +320,8 @@ func (c *Conn) writeAuthHandshake() error {
 		currentSequence := c.Sequence
 		c.Conn = packet.NewConnWithTimeout(tlsConn, c.ReadTimeout, c.WriteTimeout, c.BufferSize)
 		c.Sequence = currentSequence
+		// The TLS upgrade replaced the packet.Conn; re-apply read protection.
+		c.applyReadProtection()
 	}
 
 	// Filler [23 bytes] (all 0x00)

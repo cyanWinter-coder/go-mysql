@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/packet"
 )
 
 // userConfigurableServerCapabilities lists handshake flags that may be toggled
@@ -47,6 +48,10 @@ type Server struct {
 	authProvider      AuthenticationProvider
 	initialStatus     atomic.Uint32 // SERVER_STATUS_* flags of a new connection (see SetInitialStatus)
 	cursorsDisabled   atomic.Bool   // see SetCursorsEnabled
+
+	// Read protection applied to every new connection. See packet.Conn.
+	maxPacketSize atomic.Int64 // 0 = unlimited; packets larger than this disconnect the client
+	readLimiter   *packet.ReadLimiter
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -175,6 +180,37 @@ func (s *Server) CursorsEnabled() bool {
 
 func (s *Server) InvalidateCache(username string, host string) {
 	s.cacheShaPassword.Delete(fmt.Sprintf("%s@%s", username, host))
+}
+
+// SetMaxPacketSize caps the total payload size of any packet a client may
+// send on connections accepted afterwards. The cap applies to the whole
+// logical packet, including continuation frames and data already buffered in
+// memory; an oversized packet disconnects only that one connection with a
+// packet.ErrPacketTooLarge error. A non-positive value (the default) removes
+// the cap, so legitimate large result sets continue to work until an
+// explicit threshold is configured.
+func (s *Server) SetMaxPacketSize(maxBytes int) {
+	s.maxPacketSize.Store(int64(maxBytes))
+}
+
+// MaxPacketSize returns the per-connection packet cap, or 0 when unlimited.
+func (s *Server) MaxPacketSize() int {
+	return int(s.maxPacketSize.Load())
+}
+
+// SetReadLimiter shares a process-wide read-memory budget across all new
+// connections. Budget is only held for bytes pulled from the wire but not yet
+// delivered, so a single client can reserve at most its own packet and cannot
+// starve the others; a client that cannot acquire budget is disconnected with
+// packet.ErrReadLimitExhausted while the rest keep working. Pass nil to
+// detach.
+func (s *Server) SetReadLimiter(l *packet.ReadLimiter) {
+	s.readLimiter = l
+}
+
+// ReadLimiter returns the shared budget applied to new connections, or nil.
+func (s *Server) ReadLimiter() *packet.ReadLimiter {
+	return s.readLimiter
 }
 
 // Capability returns the capability flags advertised in the initial handshake.

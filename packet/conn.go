@@ -9,8 +9,10 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	goErrors "errors"
+	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/compress"
@@ -66,6 +68,14 @@ type Conn struct {
 	compressedHeader [7]byte
 
 	compressedReader io.Reader
+
+	// Read-protection state. See limits.go: limitCfg carries the configurable
+	// per-connection packet cap, the optional process-wide shared budget and
+	// the closed flag; stats is the upper-layer-visible read progress; reserved
+	// counts bytes this Conn currently owes the shared ReadLimiter.
+	limitCfg limitConfig
+	stats    readStatsCounters
+	reserved atomic.Int64
 }
 
 func NewConn(conn net.Conn) *Conn {
@@ -76,10 +86,11 @@ func NewBufferedConn(conn net.Conn, bufferSize int) *Conn {
 	c := new(Conn)
 	c.Conn = conn
 
-	c.br = bufio.NewReaderSize(c, bufferSize)
+	c.br = bufio.NewReaderSize(countingReader{c, c}, bufferSize)
 	c.reader = c.br
 
 	c.copyNBuf = make([]byte, DefaultBufferSize)
+	c.stats.init()
 
 	return c
 }
@@ -95,9 +106,10 @@ func NewTLSConn(conn net.Conn) *Conn {
 	c := new(Conn)
 	c.Conn = conn
 
-	c.reader = c
+	c.reader = countingReader{c, c}
 
 	c.copyNBuf = make([]byte, DefaultBufferSize)
+	c.stats.init()
 
 	return c
 }
@@ -118,7 +130,7 @@ func (c *Conn) EnableReadBuffering(bufferSize int) {
 	if c.br != nil || bufferSize <= 0 {
 		return
 	}
-	c.br = bufio.NewReaderSize(c, bufferSize)
+	c.br = bufio.NewReaderSize(countingReader{c, c}, bufferSize)
 	c.reader = c.br
 }
 
@@ -176,6 +188,9 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 }
 
 func (c *Conn) ReadPacketReuseMem(dst []byte) ([]byte, error) {
+	if err := c.checkReadable(); err != nil {
+		return nil, err
+	}
 	// Here we use `sync.Pool` to avoid allocate/destroy buffers frequently.
 	buf := utils.BytesBufferGet()
 	defer func() {
@@ -200,6 +215,9 @@ func (c *Conn) ReadPacketReuseMem(dst []byte) ([]byte, error) {
 	}
 
 	if err := c.ReadPacketTo(buf); err != nil {
+		// A failed read never returns buffered data: return the pool entry
+		// straight away so its backing array is reclaimable.
+		buf.Reset()
 		return nil, errors.Trace(err)
 	}
 
@@ -222,7 +240,19 @@ func (c *Conn) ReadPacketReuseMem(dst []byte) ([]byte, error) {
 		}
 	}
 
+	// Delivered bytes count toward the connection's lifetime progress.
+	c.stats.totalReadBytes.Add(uint64(readSize))
 	return result, nil
+}
+
+// checkReadable fails fast once the Conn has been force-closed by a read
+// protection rule: a packet fully parsed before the disconnect must never be
+// handed to an upper layer afterwards, and partial packets can never resume.
+func (c *Conn) checkReadable() error {
+	if c.isClosed() {
+		return errors.Wrapf(mysql.ErrBadConn, "%s: connection already closed", errReaderClosed)
+	}
+	return nil
 }
 
 // newCompressedPacketReader creates a new compressed packet reader.
@@ -237,7 +267,13 @@ func (c *Conn) newCompressedPacketReader() (io.Reader, error) {
 		}
 	}
 	if _, err := io.ReadFull(c.reader, c.compressedHeader[:7]); err != nil {
-		return nil, errors.Wrapf(mysql.ErrBadConn, "io.ReadFull(compressedHeader) failed. err %v", err)
+		// Keep the idle-vs-mid-packet distinction on the compressed path:
+		// waiting for a frame header with no packet bytes in flight is idle.
+		classified := c.classifyReadTimeout(err)
+		if isReadProtectionError(classified) {
+			return nil, c.failRead(classified)
+		}
+		return nil, errors.Wrapf(mysql.ErrBadConn, "io.ReadFull(compressedHeader) failed. err %v", classified)
 	}
 
 	compressedSequence := c.compressedHeader[3]
@@ -281,6 +317,83 @@ func (c *Conn) currentPacketReader() io.Reader {
 	return c.compressedReader
 }
 
+// acquireReadBudget reserves up to want bytes of shared read budget for data
+// about to leave the wire. It is non-blocking: when the process-wide budget is
+// exhausted, the connection is failed with ErrReadLimitExhausted instead of
+// queueing, so a single hungry connection cannot stall the others. Acquired
+// bytes stay reserved until released in releaseReadBudget (packet delivery or
+// forced disconnect), which is what bounds memory to the shared limit.
+func (c *Conn) acquireReadBudget(want int) (int, error) {
+	limiter := c.readLimiterLocked()
+	if limiter == nil {
+		return want, nil
+	}
+	if limiter.tryAcquire(want) {
+		c.reserved.Add(int64(want))
+		return want, nil
+	}
+	return 0, newPacketError(ErrReadLimitExhausted,
+		fmt.Sprintf("wanted %d more bytes, %d/%d in use", want, limiter.Used(), limiter.Limit()))
+}
+
+func (c *Conn) releaseReadBudget(n int) {
+	if n <= 0 {
+		return
+	}
+	if held := c.reserved.Add(-int64(n)); held < 0 {
+		// failRead may have released the whole reservation already.
+		c.reserved.Add(int64(n))
+		return
+	}
+	if limiter := c.readLimiterLocked(); limiter != nil {
+		limiter.release(n)
+	}
+}
+
+// classifyReadTimeout turns a deadline error into the idle-vs-mid-packet
+// distinction. A timeout with zero bytes of the current packet in hand means
+// the peer never started sending (idle); any progress means it stalled halfway.
+// Non-timeout errors are returned unchanged for the caller to wrap.
+func (c *Conn) classifyReadTimeout(err error) error {
+	if !isDeadlineExceeded(err) {
+		return err
+	}
+	if c.stats.currentPacketBytes.Load() == 0 {
+		c.stats.idleTimeouts.Add(1)
+		return newPacketError(ErrReadIdleTimeout,
+			fmt.Sprintf("after %s: %v", c.readTimeout, err))
+	}
+	c.stats.packetTimeouts.Add(1)
+	return newPacketError(ErrReadPacketTimeout,
+		fmt.Sprintf("after %s with %d bytes in flight: %v",
+			c.readTimeout, c.stats.currentPacketBytes.Load(), err))
+}
+
+// isDeadlineExceeded recognizes net.OpError-wrapped timeout errors from both
+// TCP and TLS transports.
+func isDeadlineExceeded(err error) bool {
+	var netErr net.Error
+	return goErrors.As(err, &netErr) && netErr.Timeout()
+}
+
+// wrapBadConn annotates ordinary read failures as bad-connection errors while
+// passing the typed read-protection errors (size/budget/timeouts) through
+// untouched: those already implement ErrBadConn via Is, and re-wrapping them
+// around a fresh ErrBadConn root would detach their sentinel from the chain.
+func (c *Conn) wrapBadConn(err error, context string) error {
+	if isReadProtectionError(err) {
+		return err
+	}
+	return errors.Wrapf(mysql.ErrBadConn, "%s. err %v", context, err)
+}
+
+func isReadProtectionError(err error) bool {
+	return goErrors.Is(err, ErrPacketTooLarge) ||
+		goErrors.Is(err, ErrReadLimitExhausted) ||
+		goErrors.Is(err, ErrReadIdleTimeout) ||
+		goErrors.Is(err, ErrReadPacketTimeout)
+}
+
 func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 	var written int64
 
@@ -296,12 +409,23 @@ func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 		// block on the connection. Otherwise keep one deadline for the entire
 		// ReadAtLeast, including partial reads; refreshing on every underlying
 		// Read would let a slow peer extend the timeout indefinitely.
-		if c.readTimeout != 0 && (c.Compression != mysql.MYSQL_COMPRESS_NONE || c.br == nil || c.br.Buffered() < bcap) {
+		needsNetwork := c.Compression != mysql.MYSQL_COMPRESS_NONE || c.br == nil || c.br.Buffered() < bcap
+		if c.readTimeout != 0 && needsNetwork {
 			if err := c.SetReadDeadline(utils.Now().Add(c.readTimeout)); err != nil {
 				return written, err
 			}
 		}
-		rd, err := io.ReadAtLeast(c.currentPacketReader(), buf, bcap)
+
+		// Reserve shared budget before any byte can land in memory. Without a
+		// limiter this is a no-op and bcap bytes are read as before.
+		want, err := c.acquireReadBudget(bcap)
+		if err != nil {
+			return written, c.failRead(err)
+		}
+		rd, readErr := io.ReadAtLeast(c.currentPacketReader(), buf, want)
+		// reads/partialReads are recorded in countingReader at each raw
+		// transport Read; here we only track packet progress.
+		c.stats.currentPacketBytes.Add(uint64(rd))
 
 		n -= int64(rd)
 
@@ -310,31 +434,53 @@ func (c *Conn) copyN(dst io.Writer, n int64) (int64, error) {
 		// the sequence number and reset the compressed reader to continue reading
 		// the remaining bytes in the next compressed packet.
 		if c.Compression != mysql.MYSQL_COMPRESS_NONE &&
-			(goErrors.Is(err, io.ErrUnexpectedEOF) || goErrors.Is(err, io.EOF)) {
+			(goErrors.Is(readErr, io.ErrUnexpectedEOF) || goErrors.Is(readErr, io.EOF)) {
 			// we have read to EOF and read an incomplete uncompressed packet
 			// so reset the compressed reader to get the remaining unread
 			// uncompressed bytes from the next compressed packet.
 			if c.compressedReader, err = c.newCompressedPacketReader(); err != nil {
+				c.releaseReadBudget(rd)
 				return written, errors.Trace(err)
 			}
+			// The EOF only marked the frame boundary; the logical packet
+			// continues from the fresh reader on the next iteration.
+			readErr = nil
 		}
 
-		if err != nil {
-			return written, errors.Trace(err)
+		if readErr != nil {
+			// On a timeout failRead releases the whole outstanding
+			// reservation itself, so do not release here first (that would
+			// double-count). Non-timeout errors do release this read's bytes.
+			classified := c.classifyReadTimeout(errors.Trace(readErr))
+			if goErrors.Is(classified, ErrReadIdleTimeout) || goErrors.Is(classified, ErrReadPacketTimeout) {
+				// A timeout is a hard disconnect: release reservations and
+				// buffered partial bytes, and mark the Conn so the packet
+				// already in flight can never be delivered.
+				return written, c.failRead(classified)
+			}
+			c.releaseReadBudget(rd)
+			return written, errors.Trace(readErr)
 		}
 
 		// careful to only write from the buffer the number of bytes read
 		wr, err := dst.Write(buf[:rd])
 		written += int64(wr)
 		if err != nil {
+			c.releaseReadBudget(rd)
 			return written, errors.Trace(err)
 		}
+		// Bytes now live in the destination (or have been delivered to the
+		// caller): release their shared-budget reservation.
+		c.releaseReadBudget(rd)
 	}
 
 	return written, nil
 }
 
 func (c *Conn) ReadPacketTo(w io.Writer) error {
+	if err := c.checkReadable(); err != nil {
+		return err
+	}
 	c.syncSequenceForRead()
 	if c.Compression != mysql.MYSQL_COMPRESS_NONE {
 		// Packets read back to back keep their own sequence; the switch to
@@ -357,7 +503,7 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 	// buffer, since copyN is capable of getting the next compressed
 	// packet and updating the Conn state with a new compressedReader.
 	if _, err := c.copyN(b, 4); err != nil {
-		return errors.Wrapf(mysql.ErrBadConn, "io.ReadFull(header) failed. err %v", err)
+		return c.wrapBadConn(err, "io.ReadFull(header) failed")
 	}
 	// copy was successful so copy the 4 bytes from the buffer to the header
 	copy(c.header[:4], b.Bytes()[:4])
@@ -374,20 +520,43 @@ func (c *Conn) ReadPacketTo(w io.Writer) error {
 
 	c.Sequence++
 
+	// Enforce the per-connection cap before any payload byte is appended. The
+	// check runs on the running total of the whole logical packet, so packets
+	// split over continuation frames cannot bypass it frame by frame, and it
+	// covers bytes already pulled into the read buffer: an oversized header
+	// already sitting in bufio is rejected here instead of being read out.
+	inFlight := c.stats.currentPacketBytes.Load()
+	if maxSize := c.maxPacketSizeLocked(); maxSize > 0 && int(inFlight)+length > maxSize {
+		c.stats.oversizedRejects.Add(1)
+		return c.failRead(newPacketError(ErrPacketTooLarge,
+			fmt.Sprintf("packet would be %d bytes (already buffered %d), limit is %d from %s",
+				int(inFlight)+length, inFlight, maxSize, c.remoteAddrString())))
+	}
+	c.stats.currentPacketExpect.Store(inFlight + uint64(length))
+
 	if buf, ok := w.(*bytes.Buffer); ok {
 		// Allocate the buffer with expected length directly instead of call `grow` and migrate data many times.
 		buf.Grow(length)
 	}
 
 	if n, err := c.copyN(w, int64(length)); err != nil {
+		if isReadProtectionError(err) {
+			return err
+		}
 		return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed. err %v, copied %v, expected %v", err, n, length)
 	} else if n != int64(length) {
 		return errors.Wrapf(mysql.ErrBadConn, "io.CopyN failed(n != int64(length)). %v bytes copied, while %v expected", n, length)
 	}
 	if length < mysql.MaxPayloadLen {
+		// A full logical packet has been delivered: clear per-packet progress.
+		c.stats.currentPacketBytes.Store(0)
+		c.stats.currentPacketExpect.Store(0)
 		return nil
 	}
 
+	// A max-length frame carries a continuation frame. The cap check above
+	// runs again on the accumulated size, so the threshold applies to the
+	// whole packet rather than to each frame independently.
 	if err := c.ReadPacketTo(w); err != nil {
 		return errors.Wrap(err, "ReadPacketTo failed")
 	}
@@ -687,6 +856,19 @@ func (c *Conn) ResetSequence() {
 
 func (c *Conn) Close() error {
 	c.Sequence = 0
+	// Mark the connection closed and hand back any shared budget so other
+	// connections can use it immediately. failRead may already have run, in
+	// which case these are no-ops.
+	c.limitCfg.mu.Lock()
+	c.limitCfg.closed = true
+	c.limitCfg.mu.Unlock()
+	if held := c.reserved.Swap(0); held > 0 {
+		if limiter := c.readLimiterLocked(); limiter != nil {
+			limiter.release(int(held))
+		}
+	}
+	c.stats.currentPacketBytes.Store(0)
+	c.stats.currentPacketExpect.Store(0)
 	if c.Conn != nil {
 		return errors.Wrap(c.Conn.Close(), "Conn.Close failed")
 	}

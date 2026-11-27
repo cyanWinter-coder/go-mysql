@@ -102,6 +102,15 @@ func (s *Server) NewCustomizedConn(conn net.Conn, authHandler AuthenticationHand
 	// flushes at each response boundary; streaming paths flush per event/row.
 	c.EnableWriteBuffering(packet.DefaultBufferSize)
 
+	// Apply read protection (per-connection packet cap and the optional
+	// process-wide shared budget) to the freshly buffered connection.
+	if max := s.MaxPacketSize(); max > 0 {
+		c.SetMaxPacketSize(max)
+	}
+	if l := s.ReadLimiter(); l != nil {
+		c.SetReadLimiter(l)
+	}
+
 	return c, nil
 }
 
