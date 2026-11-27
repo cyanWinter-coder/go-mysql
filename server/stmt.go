@@ -51,9 +51,59 @@ func (s *Stmt) ResetParams() {
 	s.longData = make([]bool, s.Params)
 }
 
+// release drops the resources a statement accumulates over its lifetime: the
+// open cursor's result set, the bound parameters, and the parsed-field caches
+// of the embedded PreparedStmt, so a deallocated statement retains nothing
+// and a stale plan can't be reused. The handler's own resources (plan caches
+// keyed by Context) are released through HandleStmtClose.
+func (s *Stmt) release() {
+	s.cursor = nil
+	s.Args = nil
+	s.longData = nil
+	s.paramTypes = nil
+	s.PreparedStmt.Release()
+}
+
 // cursorsEnabled reports whether cursors are enabled; true without a Server.
 func (c *Conn) cursorsEnabled() bool {
 	return c.serverConf == nil || c.serverConf.CursorsEnabled()
+}
+
+// maxPreparedStmtCount reports the per-connection prepared statement limit;
+// 0 (no Server, or SetMaxPreparedStmtCount(0)) means no limit.
+func (c *Conn) maxPreparedStmtCount() uint32 {
+	if c.serverConf == nil {
+		return 0
+	}
+	return c.serverConf.MaxPreparedStmtCount()
+}
+
+// handleStmtPrepare serves COM_STMT_PREPARE. A connection that already holds
+// maxPreparedStmtCount statements gets ER_MAX_PREPARED_STMT_COUNT_REACHED
+// instead of another statement.
+func (c *Conn) handleStmtPrepare(query string) (any, error) {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
+	if max := c.maxPreparedStmtCount(); max > 0 && uint32(len(c.stmts)) >= max {
+		return nil, mysql.NewDefaultError(mysql.ER_MAX_PREPARED_STMT_COUNT_REACHED, max)
+	}
+
+	c.stmtID++
+	st := new(Stmt)
+	st.ID = c.stmtID
+	st.Query = query
+	var err error
+	if st.Params, st.Columns, st.Context, err = c.h.HandleStmtPrepare(st.Query); err != nil {
+		return nil, err
+	}
+	if provider, ok := st.Context.(*stmt.PreparedStmt); ok {
+		st.RawParamFields = provider.RawParamFields
+		st.RawColumnFields = provider.RawColumnFields
+	}
+	st.ResetParams()
+	c.stmts[c.stmtID] = st
+	return st, nil
 }
 
 func (c *Conn) writePrepare(s *Stmt) error {
@@ -125,6 +175,9 @@ func (c *Conn) writePrepare(s *Stmt) error {
 }
 
 func (c *Conn) handleStmtExecute(data []byte) (any, error) {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	if len(data) < 9 {
 		return nil, mysql.ErrMalformPacket
 	}
@@ -231,6 +284,9 @@ func (c *Conn) handleStmtExecute(data []byte) (any, error) {
 // handleStmtFetch serves COM_STMT_FETCH, which asks for the next num_rows rows
 // of the cursor opened by COM_STMT_EXECUTE.
 func (c *Conn) handleStmtFetch(data []byte) (any, error) {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	if len(data) < 8 {
 		return nil, mysql.ErrMalformPacket
 	}
@@ -416,6 +472,9 @@ func (c *Conn) bindStmtArgs(s *Stmt, nullBitmap, paramTypes, paramValues []byte)
 
 // stmt send long data command has no response
 func (c *Conn) handleStmtSendLongData(data []byte) error {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	if len(data) < 6 {
 		return nil
 	}
@@ -452,6 +511,9 @@ func (c *Conn) handleStmtSendLongData(data []byte) error {
 }
 
 func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	if len(data) < 4 {
 		return nil, mysql.ErrMalformPacket
 	}
@@ -470,24 +532,29 @@ func (c *Conn) handleStmtReset(data []byte) (*mysql.Result, error) {
 	return mysql.NewResultReserveResultset(0), nil
 }
 
-// stmt close command has no response
+// stmt close command has no response. A repeated close is not an error: the
+// statement is already gone.
 func (c *Conn) handleStmtClose(data []byte) error {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	if len(data) < 4 {
 		return nil
 	}
 
 	id := binary.LittleEndian.Uint32(data[0:4])
 
-	stmt, ok := c.stmts[id]
+	st, ok := c.stmts[id]
 	if !ok {
 		return nil
 	}
 
-	if err := c.h.HandleStmtClose(stmt.Context); err != nil {
+	if err := c.h.HandleStmtClose(st.Context); err != nil {
 		return err
 	}
 
-	c.resetCursor(stmt)
+	c.resetCursor(st)
+	st.release()
 	delete(c.stmts, id)
 
 	return nil
@@ -495,17 +562,25 @@ func (c *Conn) handleStmtClose(data []byte) error {
 
 // ResetStmts deallocates every prepared statement on the connection, calling
 // HandleStmtClose for each, as MySQL does on COM_RESET_CONNECTION and
-// COM_CHANGE_USER. A handler that implements COM_RESET_CONNECTION through
-// HandleOtherCommand calls it so that statement IDs the client no longer
-// holds stop resolving. Every statement is removed even if HandleStmtClose
-// fails; the errors are joined.
+// COM_CHANGE_USER. Close calls it, so statements are released on an abnormal
+// disconnect too, and a handler that implements COM_RESET_CONNECTION through
+// HandleOtherCommand calls it so that a connection returned to a pool carries
+// no statements, cursors, or results into the next session. Every statement
+// is removed even if HandleStmtClose fails; the errors are joined.
+//
+// It must not be called from a Handler's statement callback: those run under
+// the connection's statement lock, which ResetStmts takes.
 func (c *Conn) ResetStmts() error {
+	c.stmtsMu.Lock()
+	defer c.stmtsMu.Unlock()
+
 	var errs []error
 	for id, st := range c.stmts {
 		if err := c.h.HandleStmtClose(st.Context); err != nil {
 			errs = append(errs, err)
 		}
 		c.resetCursor(st)
+		st.release()
 		delete(c.stmts, id)
 	}
 	return stderrors.Join(errs...)

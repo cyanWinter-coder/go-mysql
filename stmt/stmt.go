@@ -14,6 +14,14 @@ type PreparedStmt struct {
 	columnFields []*mysql.Field
 }
 
+// Release drops the cached parsed fields, so a deallocated statement does not
+// retain them. GetParamFields and GetColumnFields parse them again on the
+// next call.
+func (s *PreparedStmt) Release() {
+	s.paramFields = nil
+	s.columnFields = nil
+}
+
 func (s *PreparedStmt) GetParamFields() ([]*mysql.Field, error) {
 	if s.RawParamFields == nil {
 		return nil, nil

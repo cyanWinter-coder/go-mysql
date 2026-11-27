@@ -716,3 +716,110 @@ func TestResetStmtsReportsCloseErrors(t *testing.T) {
 	require.ElementsMatch(t, []any{1, 2}, h.closed)
 	require.Empty(t, c.stmts, "statements are deallocated even when a close fails")
 }
+
+// A prepare beyond the per-connection limit is rejected with
+// ER_MAX_PREPARED_STMT_COUNT_REACHED; closing a statement frees its slot.
+func TestStmtPrepareLimit(t *testing.T) {
+	c := &Conn{
+		serverConf: &Server{},
+		h:          &mockPrepareHandler{},
+		stmts:      make(map[uint32]*Stmt),
+	}
+	c.serverConf.SetMaxPreparedStmtCount(2)
+
+	prepare := []byte{mysql.COM_STMT_PREPARE, 's', 'e', 'l'}
+	require.IsType(t, &Stmt{}, c.dispatch(prepare))
+	require.IsType(t, &Stmt{}, c.dispatch(prepare))
+
+	err, ok := c.dispatch(prepare).(*mysql.MyError)
+	require.True(t, ok)
+	require.Equal(t, uint16(mysql.ER_MAX_PREPARED_STMT_COUNT_REACHED), err.Code)
+	require.ErrorContains(t, err, "current value: 2")
+	require.Len(t, c.stmts, 2, "a rejected prepare allocates nothing")
+
+	// Closing a statement frees its slot.
+	require.NoError(t, c.handleStmtClose([]byte{1, 0, 0, 0}))
+	require.IsType(t, &Stmt{}, c.dispatch(prepare))
+}
+
+// The limit defaults to MySQL's max_prepared_stmt_count; a zero-value Server
+// and SetMaxPreparedStmtCount(0) mean no limit.
+func TestServerMaxPreparedStmtCount(t *testing.T) {
+	require.Equal(t, uint32(DefaultMaxPreparedStmtCount), NewDefaultServer().MaxPreparedStmtCount())
+
+	s := &Server{}
+	require.Zero(t, s.MaxPreparedStmtCount())
+	s.SetMaxPreparedStmtCount(10)
+	require.Equal(t, uint32(10), s.MaxPreparedStmtCount())
+	s.SetMaxPreparedStmtCount(0)
+	require.Zero(t, s.MaxPreparedStmtCount())
+}
+
+// Closing a statement releases its resources; a repeated close is a no-op and
+// the stale handle gets a protocol error instead of the old result.
+func TestStmtCloseReleasesStatement(t *testing.T) {
+	h := &closeRecordingHandler{}
+	st := &Stmt{
+		Context:    1,
+		Args:       []any{1},
+		paramTypes: []byte{1, 2},
+		cursor:     &mysql.Resultset{},
+	}
+	c := &Conn{h: h, stmts: map[uint32]*Stmt{1: st}}
+
+	require.NoError(t, c.handleStmtClose([]byte{1, 0, 0, 0}))
+	require.Equal(t, []any{1}, h.closed)
+	require.Empty(t, c.stmts)
+	require.Nil(t, st.Args)
+	require.Nil(t, st.paramTypes)
+	require.Nil(t, st.cursor)
+
+	// A repeated close is safe and does not reach the handler again.
+	require.NoError(t, c.handleStmtClose([]byte{1, 0, 0, 0}))
+	require.Len(t, h.closed, 1)
+
+	_, err := c.handleStmtExecute([]byte{1, 0, 0, 0, 0, 1, 0, 0, 0})
+	require.ErrorContains(t, err, "Unknown prepared statement handler (1)")
+}
+
+// Close deallocates every statement of the connection, so an abnormal
+// disconnect releases them too; a second Close is a no-op.
+func TestConnCloseDeallocatesStmts(t *testing.T) {
+	h := &closeRecordingHandler{}
+	c := &Conn{
+		Conn:  packet.NewConn(&mockconn.MockConn{}),
+		h:     h,
+		stmts: map[uint32]*Stmt{1: {Context: 1}, 2: {Context: 2}},
+	}
+
+	c.Close()
+	require.True(t, c.Closed())
+	require.ElementsMatch(t, []any{1, 2}, h.closed)
+	require.Empty(t, c.stmts)
+
+	c.Close()
+	require.Len(t, h.closed, 2, "statements are closed once")
+}
+
+// Close racing with the command loop is safe (run with -race).
+func TestStmtConnCloseConcurrentlyWithExecute(t *testing.T) {
+	c := &Conn{
+		Conn:  packet.NewConn(&mockconn.MockConn{}),
+		h:     noResultStmtHandler{},
+		stmts: map[uint32]*Stmt{1: {}},
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			_, _ = c.handleStmtExecute([]byte{1, 0, 0, 0, 0, 1, 0, 0, 0})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		c.Close()
+	}()
+	wg.Wait()
+	require.Empty(t, c.stmts)
+}

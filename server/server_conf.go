@@ -19,6 +19,10 @@ const userConfigurableServerCapabilities = mysql.CLIENT_FOUND_ROWS |
 	mysql.CLIENT_PS_MULTI_RESULTS |
 	mysql.CLIENT_DEPRECATE_EOF
 
+// DefaultMaxPreparedStmtCount is the prepared statement limit per connection
+// a Server is created with, MySQL's default max_prepared_stmt_count.
+const DefaultMaxPreparedStmtCount = 16382
+
 // Defines a basic MySQL server with configs.
 //
 // We do not aim at implementing the whole MySQL connection suite to have the best compatibilities for the clients.
@@ -47,6 +51,7 @@ type Server struct {
 	authProvider      AuthenticationProvider
 	initialStatus     atomic.Uint32 // SERVER_STATUS_* flags of a new connection (see SetInitialStatus)
 	cursorsDisabled   atomic.Bool   // see SetCursorsEnabled
+	maxPreparedStmts  atomic.Uint32 // see SetMaxPreparedStmtCount
 }
 
 // NewDefaultServer: New mysql server with default settings.
@@ -61,7 +66,7 @@ func NewDefaultServer() *Server {
 	certPem, keyPem := generateAndSignRSACerts(caPem, caKey)
 	tlsConf := NewServerTLSConfig(caPem, certPem, keyPem, tls.VerifyClientCertIfGiven)
 	rsaPrivateKey, rsaPublicKeyBytes := getRSAKeyPairFromPEM(keyPem)
-	return &Server{
+	s := &Server{
 		serverVersion:   "8.0.11",
 		protocolVersion: 10,
 		capability: mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_LONG_FLAG | mysql.CLIENT_CONNECT_WITH_DB | mysql.CLIENT_PROTOCOL_41 |
@@ -76,6 +81,8 @@ func NewDefaultServer() *Server {
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      &DefaultAuthenticationProvider{},
 	}
+	s.maxPreparedStmts.Store(DefaultMaxPreparedStmtCount)
+	return s
 }
 
 // NewServer: New mysql server with customized settings.
@@ -118,7 +125,7 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 	if tlsConfig != nil {
 		capFlag |= mysql.CLIENT_SSL
 	}
-	return &Server{
+	s := &Server{
 		serverVersion:     serverVersion,
 		protocolVersion:   10,
 		capability:        capFlag,
@@ -130,6 +137,8 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 		cacheShaPassword:  new(sync.Map),
 		authProvider:      authProvider,
 	}
+	s.maxPreparedStmts.Store(DefaultMaxPreparedStmtCount)
+	return s
 }
 
 func isAuthMethodSupported(authMethod string) bool {
@@ -171,6 +180,22 @@ func (s *Server) SetCursorsEnabled(enabled bool) {
 // CursorsEnabled reports whether cursors are enabled (see SetCursorsEnabled).
 func (s *Server) CursorsEnabled() bool {
 	return !s.cursorsDisabled.Load()
+}
+
+// SetMaxPreparedStmtCount sets how many prepared statements one connection may
+// hold at a time (default: DefaultMaxPreparedStmtCount, MySQL's default
+// max_prepared_stmt_count). A COM_STMT_PREPARE beyond the limit is rejected
+// with ER_MAX_PREPARED_STMT_COUNT_REACHED instead of allocating another
+// statement; 0 removes the limit. It applies to prepares that start after the
+// call.
+func (s *Server) SetMaxPreparedStmtCount(n uint32) {
+	s.maxPreparedStmts.Store(n)
+}
+
+// MaxPreparedStmtCount reports the per-connection prepared statement limit
+// (see SetMaxPreparedStmtCount).
+func (s *Server) MaxPreparedStmtCount() uint32 {
+	return s.maxPreparedStmts.Load()
 }
 
 func (s *Server) InvalidateCache(username string, host string) {

@@ -32,8 +32,11 @@ type Conn struct {
 
 	h Handler
 
-	stmts  map[uint32]*Stmt
-	stmtID uint32
+	// stmtsMu guards stmts and the per-statement teardown on Close, which may
+	// run from a different goroutine than the command loop.
+	stmtsMu sync.Mutex
+	stmts   map[uint32]*Stmt
+	stmtID  uint32
 
 	closed atomic.Bool
 }
@@ -145,9 +148,18 @@ func (c *Conn) accessDeniedError(err error) error {
 		c.RemoteAddr().String(), mysql.MySQLErrName[usingPasswd])
 }
 
+// Close closes the connection and deallocates its prepared statements (see
+// ResetStmts), so statement resources are released on an abnormal disconnect
+// too, not only on COM_STMT_CLOSE. It is safe to call more than once.
 func (c *Conn) Close() {
-	c.closed.Store(true)
-	c.Conn.Close()
+	if c.closed.CompareAndSwap(false, true) {
+		// HandleStmtClose errors can't be reported from here; the statements
+		// are deallocated regardless.
+		_ = c.ResetStmts()
+	}
+	if c.Conn != nil {
+		c.Conn.Close()
+	}
 }
 
 func (c *Conn) Closed() bool {

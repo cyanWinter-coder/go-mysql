@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/go-mysql-org/go-mysql/stmt"
 	"github.com/go-mysql-org/go-mysql/utils"
 )
 
@@ -126,21 +125,11 @@ func (c *Conn) dispatch(data []byte) any {
 		}
 		return fs
 	case mysql.COM_STMT_PREPARE:
-		c.stmtID++
-		st := new(Stmt)
-		st.ID = c.stmtID
-		st.Query = utils.ByteSliceToString(data)
-		var err error
-		if st.Params, st.Columns, st.Context, err = c.h.HandleStmtPrepare(st.Query); err != nil {
+		r, err := c.handleStmtPrepare(utils.ByteSliceToString(data))
+		if err != nil {
 			return err
 		}
-		if provider, ok := st.Context.(*stmt.PreparedStmt); ok {
-			st.RawParamFields = provider.RawParamFields
-			st.RawColumnFields = provider.RawColumnFields
-		}
-		st.ResetParams()
-		c.stmts[c.stmtID] = st
-		return st
+		return r
 	case mysql.COM_STMT_EXECUTE:
 		r, err := c.handleStmtExecute(data)
 		if err != nil {
