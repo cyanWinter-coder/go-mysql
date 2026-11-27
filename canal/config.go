@@ -70,8 +70,12 @@ type Config struct {
 	IncludeTableRegex []string `toml:"include_table_regex"`
 	ExcludeTableRegex []string `toml:"exclude_table_regex"`
 
-	// discard row event without table meta
+	// Discard row event without table meta
 	DiscardNoMetaRowEvent bool `toml:"discard_no_meta_row_event"`
+
+	// FailedEventStoreDir optionally persists raw events that cannot be parsed
+	// or applied after schema rebuild failures. Empty keeps them in memory only.
+	FailedEventStoreDir string `toml:"failed_event_store_dir"`
 
 	Dump DumpConfig `toml:"dump"`
 

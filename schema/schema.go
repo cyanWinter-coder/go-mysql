@@ -72,6 +72,10 @@ type Table struct {
 	Schema string
 	Name   string
 
+	// Version is an optional source-provided table/schema version. When nil,
+	// Canal and TableCache derive a content version from the definition.
+	Version TableVersion
+
 	Columns   []TableColumn
 	Indexes   []*Index
 	PKColumns []int

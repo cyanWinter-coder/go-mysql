@@ -148,13 +148,21 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 		}
 	case *replication.QueryEvent:
 		stmts, _, err := c.parser.Parse(string(e.Query), "", "")
-		if err != nil {
+		queryParseErr := err
+		if queryParseErr != nil {
+			c.preserveUnparsedQueryEvent(ev, string(e.Query), queryParseErr)
 			if h, ok := c.eventHandler.(UnparsedQueryHandler); ok {
-				return errors.Trace(h.OnUnparsedQuery(ev.Header, pos, e, err))
+				handlerErr := h.OnUnparsedQuery(ev.Header, pos, e, queryParseErr)
+				if handlerErr != nil {
+					c.markLatestRawEventFailed(handlerErr)
+					return errors.Trace(handlerErr)
+				}
+				c.markLatestRawEventResolved()
+				return nil
 			}
 			// The parser does not understand all syntax.
 			// For example, it won't parse [CREATE|DROP] TRIGGER statements.
-			c.cfg.Logger.Error("error parsing query, will skip this event", slog.String("query", string(e.Query)), slog.Any("error", err))
+			c.baseLogger().Error("error parsing query, will skip this event but raw event is preserved", slog.String("query", string(e.Query)), slog.Any("error", queryParseErr))
 			return nil
 		}
 		for _, stmt := range stmts {
@@ -259,7 +267,7 @@ func parseStmt(stmt ast.StmtNode) (ns []*node) {
 
 func (c *Canal) updateTable(header *replication.EventHeader, db, table string) (err error) {
 	c.ClearTableCache([]byte(db), []byte(table))
-	c.cfg.Logger.Info("table structure changed, clear table cache", slog.String("database", db), slog.String("table", table))
+	c.baseLogger().Info("table structure changed, clear table cache", slog.String("database", db), slog.String("table", table))
 	if err = c.eventHandler.OnTableChanged(header, db, table); err != nil && errors.Cause(err) != schema.ErrTableNotExist {
 		return errors.Trace(err)
 	}
@@ -282,7 +290,24 @@ func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
 	schemaName := string(ev.Table.Schema)
 	tableName := string(ev.Table.Table)
 
-	t, err := c.GetTable(schemaName, tableName)
+	action, err := rowActionForType(e.Header.EventType)
+	if err != nil {
+		return err
+	}
+
+	// Serialize events for this table around metadata lookup and OnRow. DDL
+	// invalidation cannot let a second event for the same table enter with a
+	// new definition while this callback is still using the old one. Other
+	// tables have independent keys and continue concurrently.
+	key := schema.TableKey(schemaName, tableName)
+	err = c.tableEventExecutor().Do(key, func() error {
+		t, getErr := c.GetTable(schemaName, tableName)
+		if getErr != nil {
+			return getErr
+		}
+		events := newRowsEvent(t, action, ev.Rows, e.Header, ev)
+		return c.eventHandler.OnRow(events)
+	})
 	if err != nil {
 		cause := errors.Cause(err)
 		// ignore errors below
@@ -293,21 +318,103 @@ func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
 		if cause == schema.ErrTableNotExist {
 			return c.eventHandler.OnTableNotFound(e.Header, ev)
 		}
+		c.preserveFailedEvent(e, schemaName, tableName, err)
 		return err
 	}
-	var action string
-	switch e.Header.EventType {
+	return nil
+}
+
+func rowActionForType(eventType replication.EventType) (string, error) {
+	switch eventType {
 	case replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2, replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
-		action = InsertAction
+		return InsertAction, nil
 	case replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2, replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
-		action = DeleteAction
+		return DeleteAction, nil
 	case replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2, replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
-		action = UpdateAction
+		return UpdateAction, nil
 	default:
-		return errors.Errorf("%s not supported now", e.Header.EventType)
+		return "", errors.Errorf("%s not supported now", eventType)
 	}
-	events := newRowsEvent(t, action, ev.Rows, e.Header, ev)
-	return c.eventHandler.OnRow(events)
+}
+
+// preserveFailedEvent keeps the untouched binlog event when schema resolution
+// or row handling fails. Preservation never replaces the original error.
+func (c *Canal) preserveFailedEvent(e *replication.BinlogEvent, schemaName, tableName string, cause error) {
+	journal := c.RawEventJournal()
+	if journal == nil || e == nil {
+		return
+	}
+
+	position := c.safeMasterPosition()
+	rec := &RawEventRecord{
+		Schema:    schemaName,
+		Table:     tableName,
+		Key:       schema.TableKey(schemaName, tableName),
+		Position:  position.Name,
+		LogPos:    e.Header.LogPos,
+		EventType: e.Header.EventType.String(),
+		Raw:       e.RawData,
+		Binlog:    e,
+		LastError: cause.Error(),
+	}
+	if position.Name != "" {
+		rec.Position = position.String()
+	}
+	if _, err := journal.Save(rec); err != nil {
+		c.baseLogger().Error("preserve raw failed row event", slog.Any("error", err))
+	}
+}
+
+func (c *Canal) preserveUnparsedQueryEvent(e *replication.BinlogEvent, query string, cause error) *RawEventRecord {
+	journal := c.RawEventJournal()
+	if journal == nil || e == nil {
+		return nil
+	}
+
+	position := c.safeMasterPosition()
+	rec := &RawEventRecord{
+		Kind:      "unparsed-ddl",
+		Query:     query,
+		Position:  position.String(),
+		Raw:       e.RawData,
+		Binlog:    e,
+		LastError: cause.Error(),
+	}
+	if e.Header != nil {
+		rec.LogPos = e.Header.LogPos
+		rec.EventType = e.Header.EventType.String()
+	}
+	saved, err := journal.Save(rec)
+	if err != nil {
+		c.baseLogger().Error("preserve raw unparsed query event", slog.Any("error", err))
+		return rec
+	}
+	return saved
+}
+
+func (c *Canal) markLatestRawEventResolved() {
+	journal := c.RawEventJournal()
+	records := journal.List()
+	if len(records) == 0 {
+		return
+	}
+	if err := journal.Resolve(records[len(records)-1].ID); err != nil {
+		c.baseLogger().Error("resolve preserved query event", slog.Any("error", err))
+	}
+}
+
+func (c *Canal) markLatestRawEventFailed(cause error) {
+	journal := c.RawEventJournal()
+	records := journal.List()
+	if len(records) == 0 {
+		return
+	}
+	rec := records[len(records)-1]
+	rec.Resolved = false
+	rec.LastError = cause.Error()
+	if _, err := journal.Save(rec); err != nil {
+		c.baseLogger().Error("update preserved query event", slog.Any("error", err))
+	}
 }
 
 func (c *Canal) FlushBinlog() error {

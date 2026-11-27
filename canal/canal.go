@@ -45,7 +45,12 @@ type Canal struct {
 
 	tableLock          sync.RWMutex
 	tables             map[string]*schema.Table
+	tableStates        map[string]*tableMetadataState
 	errorTablesGetTime map[string]time.Time
+
+	failedEvents  *FailedEventJournal
+	failedOnce    sync.Once
+	tableExecutor *KeyedExecutor
 
 	tableMatchCache   map[string]bool
 	includeTableRegex []*regexp.Regexp
@@ -80,12 +85,16 @@ func NewCanal(cfg *Config) (*Canal, error) {
 	c.eventHandler = &DummyEventHandler{}
 	c.parser = parser.New()
 	c.tables = make(map[string]*schema.Table)
+	c.tableStates = make(map[string]*tableMetadataState)
+	var err error
+	c.failedEvents, err = NewFailedEventJournal(c.cfg.FailedEventStoreDir, c.cfg.Logger)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 	if c.cfg.DiscardNoMetaRowEvent {
 		c.errorTablesGetTime = make(map[string]time.Time)
 	}
 	c.master = &masterInfo{logger: c.cfg.Logger}
-
-	var err error
 
 	if err = c.prepareDumper(); err != nil {
 		return nil, errors.Trace(err)
@@ -321,100 +330,8 @@ func (c *Canal) checkTableMatch(key string) bool {
 	return matchFlag
 }
 
-func (c *Canal) GetTable(db string, table string) (*schema.Table, error) {
-	key := fmt.Sprintf("%s.%s", db, table)
-	// if table is excluded, return error and skip parsing event or dump
-	if !c.checkTableMatch(key) {
-		return nil, ErrExcludedTable
-	}
-	c.tableLock.RLock()
-	t, ok := c.tables[key]
-	c.tableLock.RUnlock()
-
-	if ok {
-		return t, nil
-	}
-
-	if c.cfg.DiscardNoMetaRowEvent {
-		c.tableLock.RLock()
-		lastTime, ok := c.errorTablesGetTime[key]
-		c.tableLock.RUnlock()
-		if ok && time.Since(lastTime) < UnknownTableRetryPeriod {
-			return nil, schema.ErrMissingTableMeta
-		}
-	}
-
-	t, err := schema.NewTable(c, db, table)
-	if err != nil {
-		// check table not exists
-		if ok, err1 := schema.IsTableExist(c, db, table); err1 == nil && !ok {
-			return nil, schema.ErrTableNotExist
-		}
-		// work around : RDS HAHeartBeat
-		// ref : https://github.com/alibaba/canal/blob/master/parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/dbsync/LogEventConvert.java#L385
-		// issue : https://github.com/alibaba/canal/issues/222
-		// This is a common error in RDS that canal can't get HAHealthCheckSchema's meta, so we mock a table meta.
-		// If canal just skip and log error, as RDS HA heartbeat interval is very short, so too many HAHeartBeat errors will be logged.
-		if key == schema.HAHealthCheckSchema {
-			// mock ha_health_check meta
-			ta := &schema.Table{
-				Schema:  db,
-				Name:    table,
-				Columns: make([]schema.TableColumn, 0, 2),
-				Indexes: make([]*schema.Index, 0),
-			}
-			ta.AddColumn("id", "bigint(20)", "", "")
-			ta.AddColumn("type", "char(1)", "", "")
-			c.tableLock.Lock()
-			c.tables[key] = ta
-			c.tableLock.Unlock()
-			return ta, nil
-		}
-		// if DiscardNoMetaRowEvent is true, we just log this error
-		if c.cfg.DiscardNoMetaRowEvent {
-			c.tableLock.Lock()
-			c.errorTablesGetTime[key] = utils.Now()
-			c.tableLock.Unlock()
-			// log error and return ErrMissingTableMeta
-			c.cfg.Logger.Error("canal get table meta err", slog.Any("error", errors.Trace(err)))
-			return nil, schema.ErrMissingTableMeta
-		}
-		return nil, err
-	}
-
-	c.tableLock.Lock()
-	c.tables[key] = t
-	if c.cfg.DiscardNoMetaRowEvent {
-		// if get table info success, delete this key from errorTablesGetTime
-		delete(c.errorTablesGetTime, key)
-	}
-	c.tableLock.Unlock()
-
-	return t, nil
-}
-
-// ClearTableCache clear table cache
-func (c *Canal) ClearTableCache(db []byte, table []byte) {
-	key := fmt.Sprintf("%s.%s", db, table)
-	c.tableLock.Lock()
-	delete(c.tables, key)
-	if c.cfg.DiscardNoMetaRowEvent {
-		delete(c.errorTablesGetTime, key)
-	}
-	c.tableLock.Unlock()
-}
-
-// SetTableCache sets table cache value for the given table
-func (c *Canal) SetTableCache(db []byte, table []byte, schema *schema.Table) {
-	key := fmt.Sprintf("%s.%s", db, table)
-	c.tableLock.Lock()
-	c.tables[key] = schema
-	if c.cfg.DiscardNoMetaRowEvent {
-		// if get table info success, delete this key from errorTablesGetTime
-		delete(c.errorTablesGetTime, key)
-	}
-	c.tableLock.Unlock()
-}
+// GetTable, ClearTableCache and SetTableCache are implemented in
+// table_metadata.go, where per-table rebuild and version state live.
 
 // CheckBinlogRowImage checks MySQL binlog row image, must be in FULL, MINIMAL, NOBLOB
 func (c *Canal) CheckBinlogRowImage(image string) error {
